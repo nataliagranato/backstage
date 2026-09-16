@@ -2,43 +2,48 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Card "Operações AWS" na página da entidade do Backstage que executa deploy, rollback e status de stacks CloudFormation (Lambda + DynamoDB + S3) via plugin backend próprio.
+**Goal:** Card "Operações AWS" na página da entidade do Backstage que executa deploy, rollback e status de infraestrutura Terraform/OpenTofu (Lambda + DynamoDB) na conta AWS, com templates versionados em S3 e audit log.
 
-**Architecture:** Backend plugin `aws-ops` (arquivo único em `packages/backend/src/aws-ops.ts`, padrão do repo = verboo-actions.ts) com rotas HTTP `/status`, `/deploy`, `/rollback`, AWS SDK v3, templates versionados em S3 e audit log em sqlite (databaseService). Frontend: módulo `packages/app/src/modules/aws-ops` com EntityCardBlueprint (novo frontend system, padrão do repo = modules/nav, modules/home).
+**Architecture:** Backend plugin `aws-ops` (arquivos em `packages/backend/src/aws-ops*.ts`, padrão do repo = verboo-actions.ts) com rotas HTTP `/status`, `/deploy`, `/rollback`, `/audit`. Deploy/rollback invocam a CLI **Terraform/OpenTofu** via `execFile` em workdir por stack (`/tmp/aws-ops/<stack>`), com state remoto no S3 (backend s3, key por stack) e templates HCL versionados no mesmo bucket. Frontend: módulo `packages/app/src/modules/aws-ops` com EntityCardBlueprint (novo frontend system, padrão do repo = modules/home).
 
-**Tech Stack:** Backstage 1.54.0 (novo frontend system), `@aws-sdk/client-cloudformation`, `@aws-sdk/client-s3`, knex via `coreServices.database`, React + `@backstage/plugin-catalog-react/alpha` (EntityCardBlueprint), jest via `backstage-cli repo test`.
+**Tech Stack:** Backstage 1.54.0 (novo frontend system), `@aws-sdk/client-s3`, OpenTofu CLI (`tofu`, instalada em `/usr/bin/tofu`) ou Terraform (`awsOps.binary`), knex via `coreServices.database`, React + `@backstage/plugin-catalog-react/alpha` (EntityCardBlueprint), jest via `backstage-cli repo test`.
 
 **Spec:** `docs/superpowers/specs/2026-09-16-aws-ops-bot-design.md`
 
 ## Global Constraints
 
-- Desvio consciente do spec aprovado: em vez de workspaces `plugins/aws-ops-backend` e `plugins/aws-ops`, o backend é um arquivo em `packages/backend/src/aws-ops.ts` e o frontend um módulo em `packages/app/src/modules/aws-ops/` — segue o padrão existente do repo (verboo-actions.ts, modules/home) e elimina 2 package.json + tsconfig de boilerplate.
-- Sem `DeleteStack` em qualquer rota (spec: fora de escopo).
-- Nenhuma credencial AWS no repo — default credential chain.
+- **Terraform/OpenTofu como mecanismo de deploy/rollback** (não CloudFormation). Binário configurável: `awsOps.binary` (default `terraform`; nesta máquina `tofu`). NUNCA usar shell string — sempre `execFile(bin, args)`.
+- **Bootstrap do bucket de state**: o bucket S3 (state + templates versionados) é criado uma única vez por um módulo `examples/aws/bootstrap/` com state LOCAL (quebra o ovo-galinha), rodado manualmente via CLI. O bot nunca gerencia o próprio bucket.
+- Sem `destroy` em qualquer rota (spec: fora de escopo — não existe botão de destruir infra).
+- Nenhuma credencial AWS no repo — default credential chain (env/profile herdado pela CLI e pelo SDK).
 - Documentação e comentários visíveis ao usuário em pt-BR.
 - Yarn workspaces; testes com `yarn workspace backend test` / `yarn run test`; typecheck com `yarn tsc`.
 - Ação mutante (deploy/rollback) sempre auditada; UI pede confirmação nativa (`window.confirm`).
+- `stackName` validado com `/^[a-zA-Z0-9-]{1,100}$/` em toda rota que o recebe (vira workdir, chave S3 e key do state).
 
 ---
 
-### Task 1: Helpers de rollback e upsert (lógica pura + testes)
+### Task 1: Helpers — versionamento S3 e wrapper da CLI (lógica + testes)
 
 **Files:**
 - Create: `packages/backend/src/aws-ops-helpers.ts`
 - Test: `packages/backend/src/aws-ops-helpers.test.ts`
 
 **Interfaces:**
-- Consumes: nada (funções puras).
+- Consumes: nada (funções puras + child_process).
 - Produces:
-  - `pickPreviousVersion(versions: ObjectVersion[], currentId: string): string | undefined` — recebe versões S3, retorna VersionId do template anterior ao `currentId` (mais recente entre os mais antigos).
-  - `upsertStack(cfn: CloudFormationClient, stackName: string, templateBody: string): Promise<'updated' | 'created'>` — UpdateStack; se ValidationError "does not exist", CreateStack.
+  - `pickPreviousVersion(versions: ObjectVersion[], currentId: string): string | undefined` — retorna VersionId do template HCL anterior ao `currentId`.
+  - `runTerraform(binary: string, args: string[], workdir: string, timeoutMs?: number): Promise<{stdout: string; stderr: string}>` — `execFile` com timeout (default 300s) e `cwd=workdir`; rejeita com o stderr na mensagem.
 
 - [ ] **Step 1: Escrever os testes que falham**
 
 `packages/backend/src/aws-ops-helpers.test.ts`:
 
 ```ts
-import { pickPreviousVersion } from './aws-ops-helpers';
+import { promises as fs } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { pickPreviousVersion, runTerraform } from './aws-ops-helpers';
 
 describe('pickPreviousVersion', () => {
   const mk = (id: string, daysAgo: number, isLatest = false) => ({
@@ -71,6 +76,37 @@ describe('pickPreviousVersion', () => {
     expect(pickPreviousVersion(versions as any, 'v2')).toBe('v1');
   });
 });
+
+describe('runTerraform', () => {
+  it('executa o binário no workdir e retorna stdout', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'tf-test-'));
+    // "binário" de teste: script shell que imprime o cwd
+    const bin = path.join(dir, 'fake-tf');
+    await fs.writeFile(bin, '#!/bin/sh\necho "workdir: $(pwd)"\n');
+    await fs.chmod(bin, 0o755);
+
+    const { stdout } = await runTerraform(bin, [], dir);
+    expect(stdout).toBe(`workdir: ${dir}\n`);
+  });
+
+  it('propaga erro com stderr na mensagem quando o binário falha', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'tf-test-'));
+    const bin = path.join(dir, 'fake-tf-fail');
+    await fs.writeFile(bin, '#!/bin/sh\necho "boom" >&2\nexit 1\n');
+    await fs.chmod(bin, 0o755);
+
+    await expect(runTerraform(bin, [], dir)).rejects.toThrow(/boom/);
+  });
+
+  it('estoura timeout quando o binário travar', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'tf-test-'));
+    const bin = path.join(dir, 'fake-tf-slow');
+    await fs.writeFile(bin, '#!/bin/sh\nsleep 5\n');
+    await fs.chmod(bin, 0o755);
+
+    await expect(runTerraform(bin, [], dir, 200)).rejects.toThrow();
+  }, 10_000);
+});
 ```
 
 - [ ] **Step 2: Rodar e ver falhar**
@@ -83,11 +119,10 @@ Expected: FAIL — módulo `./aws-ops-helpers` não existe.
 `packages/backend/src/aws-ops-helpers.ts`:
 
 ```ts
-import {
-  CloudFormationClient,
-  CreateStackCommand,
-  UpdateStackCommand,
-} from '@aws-sdk/client-cloudformation';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 export type ObjectVersion = {
   VersionId?: string;
@@ -107,62 +142,40 @@ export function pickPreviousVersion(
         v.LastModified &&
         !v.IsLatest,
     )
-    .sort(
-      (a, b) => b.LastModified!.getTime() - a.LastModified!.getTime(),
-    );
+    .sort((a, b) => b.LastModified!.getTime() - a.LastModified!.getTime());
   return older[0]?.VersionId;
 }
 
-export async function upsertStack(
-  cfn: CloudFormationClient,
-  stackName: string,
-  templateBody: string,
-): Promise<'updated' | 'created'> {
+export async function runTerraform(
+  binary: string,
+  args: string[],
+  workdir: string,
+  timeoutMs = 300_000,
+): Promise<{ stdout: string; stderr: string }> {
   try {
-    await cfn.send(
-      new UpdateStackCommand({
-        StackName: stackName,
-        TemplateBody: templateBody,
-        Capabilities: ['CAPABILITY_NAMED_IAM'],
-      }),
-    );
-    return 'updated';
+    return await execFileAsync(binary, args, {
+      cwd: workdir,
+      timeout: timeoutMs,
+      maxBuffer: 10 * 1024 * 1024,
+    });
   } catch (e: any) {
-    // primeira execução: a stack ainda não existe -> cria
-    if (
-      e.name === 'ValidationError' &&
-      /does not exist/i.test(String(e.message))
-    ) {
-      await cfn.send(
-        new CreateStackCommand({
-          StackName: stackName,
-          TemplateBody: templateBody,
-          Capabilities: ['CAPABILITY_NAMED_IAM'],
-        }),
-      );
-      return 'created';
-    }
-    throw e;
+    // devolve stderr na mensagem para o card/audit exibirem o erro real da CLI
+    const stderr = e?.stderr || e?.message || String(e);
+    throw new Error(`falha na CLI (${binary} ${args.join(' ')}): ${stderr}`);
   }
 }
-```
-
-Instalar dependência:
-
-```bash
-yarn workspace backend add @aws-sdk/client-cloudformation @aws-sdk/client-s3
 ```
 
 - [ ] **Step 4: Rodar os testes e ver passar**
 
 Run: `yarn workspace backend test src/aws-ops-helpers.test.ts`
-Expected: PASS (4 testes).
+Expected: PASS (7 testes).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/backend/src/aws-ops-helpers.ts packages/backend/src/aws-ops-helpers.test.ts packages/backend/package.json yarn.lock
-git commit -m "feat(aws-ops): helpers de rollback S3 e upsert CloudFormation"
+git add packages/backend/src/aws-ops-helpers.ts packages/backend/src/aws-ops-helpers.test.ts
+git commit -m "feat(aws-ops): helpers de versionamento S3 e wrapper da CLI terraform/tofu"
 ```
 
 ---
@@ -175,73 +188,97 @@ git commit -m "feat(aws-ops): helpers de rollback S3 e upsert CloudFormation"
 - Test: `packages/backend/src/aws-ops.test.ts`
 
 **Interfaces:**
-- Consumes: `pickPreviousVersion`, `upsertStack` (Task 1).
+- Consumes: `pickPreviousVersion`, `runTerraform` (Task 1).
 - Produces (HTTP API consumida pelo card no Task 3):
-  - `GET /api/aws-ops/status?stack=<nome>` → `200 {stackName, stackStatus, lastUpdatedTime}` ou `404 {error}` (stack não existe) ou `500 {error}`.
-  - `POST /api/aws-ops/deploy` body `{stackName, templateBody}` → `200 {action: 'updated'|'created', versionId}`.
+  - `GET /api/aws-ops/status?stack=<nome>` → `200 {stack, outputs}` ou `404 {error}` (não provisionada) ou `400 {error}`.
+  - `POST /api/aws-ops/deploy` body `{stackName, templateBody}` → `200 {action: 'deploy', versionId}` ou `400/500 {error}`.
   - `POST /api/aws-ops/rollback` body `{stackName}` → `200 {action: 'rollback', versionId}` ou `409 {error}` (sem versão anterior).
-  - `GET /api/aws-ops/audit?stack=<nome>` → `200 [{ts, action, stack, result}]` (50 últimos).
+  - `GET /api/aws-ops/audit?stack=<nome>` → `200 [{id, ts, action, stack, result}]` (50 últimos).
 
-Config em `app-config.yaml`: `awsOps.bucket` (obrigatório para deploy/rollback), `awsOps.region` (default us-east-1).
+Config em `app-config.yaml`: `awsOps.binary` (default `terraform`), `awsOps.bucket` (obrigatório), `awsOps.region` (default us-east-1). Implementação usa `createAwsOpsRouter(opts)` com dependências injetadas (sem wrap de rotas).
 
-- [ ] **Step 1: Escrever o teste que falha**
+- [ ] **Step 1: Deps + teste que falha**
 
-`packages/backend/src/aws-ops.test.ts` — testa o roteador via mocks dos clients AWS:
+```bash
+yarn workspace backend add @aws-sdk/client-s3
+yarn workspace backend add -D aws-sdk-client-mock
+```
+
+`packages/backend/src/aws-ops.test.ts`:
 
 ```ts
 import { createAwsOpsRouter } from './aws-ops';
 import { mockClient } from 'aws-sdk-client-mock';
 import {
-  CloudFormationClient,
-  DescribeStacksCommand,
-} from '@aws-sdk/client-cloudformation';
+  GetObjectCommand,
+  ListObjectVersionsCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
+import { Readable } from 'stream';
 import express from 'express';
 import request from 'supertest';
 
-const cfnMock = mockClient(CloudFormationClient);
+const s3Mock = mockClient(S3Client);
+
+// stub da CLI: nenhum teste toca o tofu real
+jest.mock('./aws-ops-helpers', () => {
+  const actual = jest.requireActual('./aws-ops-helpers');
+  return {
+    ...actual,
+    runTerraform: jest.fn().mockResolvedValue({ stdout: '{}', stderr: '' }),
+  };
+});
+import { runTerraform } from './aws-ops-helpers';
+
+const streamOf = (body: string) => Readable.from([body]);
 
 describe('aws-ops router', () => {
-  const app = express().use(express.json()).use(createAwsOpsRouter());
+  const app = express().use(express.json()).use(
+    createAwsOpsRouter({
+      bucket: 'test-bucket',
+      region: 'us-east-1',
+      binary: 'terraform',
+      db: null,
+    }),
+  );
 
-  beforeEach(() => cfnMock.reset());
-
-  it('GET /status retorna stackStatus de uma stack existente', async () => {
-    cfnMock
-      .on(DescribeStacksCommand)
-      .resolves({
-        Stacks: [
-          {
-            StackName: 'minha-api',
-            StackStatus: 'CREATE_COMPLETE',
-            LastUpdatedTime: new Date('2026-09-16T12:00:00Z'),
-          },
-        ],
-      });
-    const res = await request(app).get('/status?stack=minha-api');
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({
-      stackName: 'minha-api',
-      stackStatus: 'CREATE_COMPLETE',
-    });
-  });
-
-  it('GET /status retorna 404 para stack inexistente', async () => {
-    cfnMock.on(DescribeStacksCommand).resolves({ Stacks: [] });
-    const res = await request(app).get('/status?stack=inexistente');
-    expect(res.status).toBe(404);
+  beforeEach(() => {
+    s3Mock.reset();
+    (runTerraform as jest.Mock).mockClear();
+    (runTerraform as jest.Mock).mockResolvedValue({ stdout: '{}', stderr: '' });
   });
 
   it('POST /deploy rejeita payload sem stackName ou templateBody', async () => {
     const res = await request(app).post('/deploy').send({});
     expect(res.status).toBe(400);
   });
+
+  it('POST /deploy rejeita stackName inválido', async () => {
+    const res = await request(app)
+      .post('/deploy')
+      .send({ stackName: '../evil', templateBody: 'resource {}' });
+    expect(res.status).toBe(400);
+  });
+
+  it('GET /status sem query stack retorna 400', async () => {
+    const res = await request(app).get('/status');
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /rollback retorna 409 quando não há versão anterior', async () => {
+    s3Mock
+      .on(GetObjectCommand)
+      .resolves({
+        Body: streamOf(JSON.stringify({ key: 't/main.tf', versionId: 'v2' })),
+      })
+      .on(ListObjectVersionsCommand)
+      .resolves({
+        Versions: [{ VersionId: 'v2', IsLatest: true, LastModified: new Date() }],
+      });
+    const res = await request(app).post('/rollback').send({ stackName: 'minha-api' });
+    expect(res.status).toBe(409);
+  });
 });
-```
-
-Dep de teste:
-
-```bash
-yarn workspace backend add -D aws-sdk-client-mock supertest @types/supertest
 ```
 
 - [ ] **Step 2: Rodar e ver falhar**
@@ -254,183 +291,221 @@ Expected: FAIL — `createAwsOpsRouter` não existe.
 `packages/backend/src/aws-ops.ts`:
 
 ```ts
-import {
-  CloudFormationClient,
-  DescribeStacksCommand,
-} from '@aws-sdk/client-cloudformation';
+import { createBackendPlugin, coreServices } from '@backstage/backend-plugin-api';
+import { Router } from 'express';
+import { promises as fs } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
   GetObjectCommand,
   ListObjectVersionsCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { DatabaseService, coreServices, createBackendPlugin } from '@backstage/backend-plugin-api';
-import { Config } from '@backstage/config';
-import express, { Router } from 'express';
-import { pickPreviousVersion, upsertStack } from './aws-ops-helpers';
+import { pickPreviousVersion, runTerraform } from './aws-ops-helpers';
 
-// audit log em sqlite (databaseService do backend). ponytail: schema criado
-// ad-hoc no init; para produção mover para migration versionada.
-async function ensureAuditTable(db: DatabaseService) {
-  const client = await db.getClient();
-  if (!await client.schema.hasTable('aws_ops_audit')) {
-    await client.schema.createTable('aws_ops_audit', t => {
+const STACK_RE = /^[a-zA-Z0-9-]{1,100}$/;
+
+type Opts = {
+  bucket: string;
+  region: string;
+  binary: string;
+  db: any; // knex client; nos testes é null (audit fica inerte)
+};
+
+async function bodyOf(res: any): Promise<string> {
+  return res.Body.transformToString();
+}
+
+async function ensureAuditTable(db: any) {
+  if (!db) return;
+  if (!(await db.schema.hasTable('aws_ops_audit'))) {
+    await db.schema.createTable('aws_ops_audit', (t: any) => {
       t.increments('id').primary();
-      t.timestamp('ts').defaultTo(client.fn.now());
+      t.timestamp('ts').defaultTo(db.fn.now());
       t.string('action').notNullable();
       t.string('stack').notNullable();
       t.string('result').notNullable();
     });
   }
-  return client;
 }
 
-export function createAwsOpsRouter(): Router {
-  const cfn = new CloudFormationClient({});
-  const s3 = new S3Client({});
+async function audit(db: any, action: string, stack: string, result: string) {
+  if (!db) return;
+  await db('aws_ops_audit').insert({ action, stack, result });
+}
 
+// backend.tf + provider.tf gerados pelo bot; o template do usuário só tem resources
+async function writeWorkdir(
+  opts: Opts,
+  stackName: string,
+  templateBody: string,
+): Promise<string> {
+  const workdir = path.join(os.tmpdir(), 'aws-ops', stackName);
+  await fs.mkdir(workdir, { recursive: true });
+  await fs.writeFile(
+    path.join(workdir, 'backend.tf'),
+    `terraform {\n  backend "s3" {\n    bucket = "${opts.bucket}"\n    key    = "states/${stackName}.tfstate"\n    region = "${opts.region}"\n  }\n}\n`,
+  );
+  await fs.writeFile(
+    path.join(workdir, 'provider.tf'),
+    `provider "aws" {\n  region = "${opts.region}"\n}\n`,
+  );
+  await fs.writeFile(path.join(workdir, 'main.tf'), templateBody);
+  return workdir;
+}
+
+async function deploy(
+  opts: Opts,
+  stackName: string,
+  templateBody: string,
+): Promise<{ action: string; versionId: string }> {
+  const client = new S3Client({ region: opts.region });
+  const workdir = await writeWorkdir(opts, stackName, templateBody);
+
+  await runTerraform(opts.binary, ['init', '-input=false', '-no-color'], workdir);
+  await runTerraform(
+    opts.binary,
+    ['apply', '-auto-approve', '-input=false', '-no-color'],
+    workdir,
+  );
+
+  // versiona o template no bucket e move o ponteiro CURRENT
+  const key = `templates/${stackName}/${Date.now()}.tf`;
+  const put = await client.send(
+    new PutObjectCommand({ Bucket: opts.bucket, Key: key, Body: templateBody }),
+  );
+  await client.send(
+    new PutObjectCommand({
+      Bucket: opts.bucket,
+      Key: `templates/${stackName}/CURRENT`,
+      Body: JSON.stringify({ key, versionId: put.VersionId }),
+    }),
+  );
+  return { action: 'deploy', versionId: put.VersionId! };
+}
+
+async function rollback(
+  opts: Opts,
+  stackName: string,
+): Promise<{ action: string; versionId: string }> {
+  const client = new S3Client({ region: opts.region });
+
+  const current = await client.send(
+    new GetObjectCommand({ Bucket: opts.bucket, Key: `templates/${stackName}/CURRENT` }),
+  );
+  const cur = JSON.parse(await bodyOf(current)) as { key: string; versionId: string };
+
+  const versions = await client.send(
+    new ListObjectVersionsCommand({ Bucket: opts.bucket, Prefix: `templates/${stackName}/` }),
+  );
+  const prevId = pickPreviousVersion((versions.Versions ?? []) as any, cur.versionId);
+  if (!prevId) {
+    throw Object.assign(new Error('sem versão anterior para rollback'), {
+      statusCode: 409,
+    });
+  }
+  const prev = await client.send(
+    new GetObjectCommand({ Bucket: opts.bucket, Key: cur.key, VersionId: prevId }),
+  );
+  const templateBody = await bodyOf(prev);
+
+  const workdir = await writeWorkdir(opts, stackName, templateBody);
+  await runTerraform(opts.binary, ['init', '-input=false', '-no-color'], workdir);
+  await runTerraform(
+    opts.binary,
+    ['apply', '-auto-approve', '-input=false', '-no-color'],
+    workdir,
+  );
+
+  await client.send(
+    new PutObjectCommand({
+      Bucket: opts.bucket,
+      Key: `templates/${stackName}/CURRENT`,
+      Body: JSON.stringify({ key: cur.key, versionId: prevId }),
+    }),
+  );
+  return { action: 'rollback', versionId: prevId };
+}
+
+export function createAwsOpsRouter(opts: Opts): Router {
   const router = Router();
 
   router.get('/status', async (req, res) => {
     const stackName = String(req.query.stack ?? '');
-    if (!stackName) {
-      res.status(400).json({ error: 'query param "stack" é obrigatório' });
+    if (!STACK_RE.test(stackName)) {
+      res.status(400).json({
+        error: 'query param "stack" é obrigatório (letras, números e hífen)',
+      });
       return;
     }
+    const workdir = path.join(os.tmpdir(), 'aws-ops', stackName);
     try {
-      const out = await cfn.send(
-        new DescribeStacksCommand({ StackName: stackName }),
+      const { stdout } = await runTerraform(
+        opts.binary,
+        ['output', '-json', '-no-color'],
+        workdir,
+        30_000,
       );
-      const stack = out.Stacks?.[0];
-      if (!stack) {
-        res.status(404).json({ error: `stack ${stackName} não encontrada` });
-        return;
-      }
-      res.json({
-        stackName: stack.StackName,
-        stackStatus: stack.StackStatus,
-        lastUpdatedTime: stack.LastUpdatedTime,
-      });
-    } catch (e: any) {
-      if (e.name === 'ValidationError' && /does not exist/i.test(String(e.message))) {
-        res.status(404).json({ error: `stack ${stackName} não encontrada` });
-        return;
-      }
-      res.status(500).json({ error: String(e.message) });
+      res.json({ stack: stackName, outputs: JSON.parse(stdout || '{}') });
+    } catch {
+      res
+        .status(404)
+        .json({ error: `stack ${stackName} não provisionada (sem state local)` });
     }
   });
 
   router.post('/deploy', async (req, res) => {
-    const { stackName, templateBody, bucket } = req.body ?? {};
-    if (!stackName || !templateBody || !bucket) {
-      res.status(400).json({ error: 'stackName, templateBody e bucket são obrigatórios' });
-      return;
-    }
-    // trust boundary: stackName vira caminho/chave S3 e nome de recurso AWS
-    if (!/^[a-zA-Z0-9-]{1,100}$/.test(stackName)) {
-      res.status(400).json({ error: 'stackName inválido (use letras, números e hífen)' });
+    const { stackName, templateBody } = req.body ?? {};
+    if (!stackName || !templateBody || !STACK_RE.test(stackName)) {
+      res
+        .status(400)
+        .json({ error: 'stackName (letras/números/hífen) e templateBody são obrigatórios' });
       return;
     }
     try {
-      const versionId = await deployVersion(s3, bucket, stackName, templateBody);
-      const action = await upsertStack(cfn, stackName, templateBody);
-      res.json({ action, versionId });
+      const out = await deploy(opts, stackName, String(templateBody));
+      await audit(opts.db, 'deploy', stackName, String(res.statusCode));
+      res.json(out);
     } catch (e: any) {
+      await audit(opts.db, 'deploy', stackName, `erro: ${String(e.message).slice(0, 200)}`);
       res.status(500).json({ error: String(e.message) });
     }
   });
 
   router.post('/rollback', async (req, res) => {
-    const { stackName, bucket } = req.body ?? {};
-    if (!stackName || !bucket) {
-      res.status(400).json({ error: 'stackName e bucket são obrigatórios' });
+    const { stackName } = req.body ?? {};
+    if (!stackName || !STACK_RE.test(stackName)) {
+      res
+        .status(400)
+        .json({ error: 'stackName (letras/números/hífen) é obrigatório' });
       return;
     }
     try {
-      const versionId = await rollback(s3, bucket, stackName);
-      res.json({ action: 'rollback', versionId });
+      const out = await rollback(opts, stackName);
+      await audit(opts.db, 'rollback', stackName, String(res.statusCode));
+      res.json(out);
     } catch (e: any) {
-      const status = /sem versão anterior/.test(String(e.message)) ? 409 : 500;
-      res.status(status).json({ error: String(e.message) });
+      await audit(opts.db, 'rollback', stackName, `erro: ${String(e.message).slice(0, 200)}`);
+      res.status(e?.statusCode ?? 500).json({ error: String(e.message) });
     }
   });
 
-  router.get('/audit', async (_req, res) => {
-    // preenchido no init (precisa do databaseService); rota declarada aqui
-    // para o contrato HTTP ficar visível em createAwsOpsRouter.
-    res.status(501).json({ error: 'audit requer init com database' });
+  router.get('/audit', async (req, res) => {
+    if (!opts.db) {
+      res.status(501).json({ error: 'audit indisponível sem database' });
+      return;
+    }
+    const stack = String(req.query.stack ?? '');
+    const rows = await opts
+      .db('aws_ops_audit')
+      .where(stack ? { stack } : {})
+      .orderBy('id', 'desc')
+      .limit(50);
+    res.json(rows);
   });
 
   return router;
-}
-
-async function deployVersion(
-  s3: S3Client,
-  bucket: string,
-  stackName: string,
-  templateBody: string,
-): Promise<string> {
-  const key = `templates/${stackName}/${Date.now()}.yaml`;
-  const put = await s3.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body: templateBody,
-    }),
-  );
-  // marca a versão corrente para o rollback saber de onde voltar
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: `templates/${stackName}/CURRENT`,
-      Body: JSON.stringify({ key, versionId: put.VersionId }),
-    }),
-  );
-  return put.VersionId!;
-}
-
-async function rollback(
-  s3: S3Client,
-  bucket: string,
-  stackName: string,
-): Promise<string> {
-  const current = await s3.send(
-    new GetObjectCommand({ Bucket: bucket, Key: `templates/${stackName}/CURRENT` }),
-  );
-  const currentBody = JSON.parse(
-    await current.Body!.transformToString(),
-  ) as { key: string; versionId: string };
-
-  const versions = await s3.send(
-    new ListObjectVersionsCommand({
-      Bucket: bucket,
-      Prefix: `templates/${stackName}/`,
-    }),
-  );
-  const prevId = pickPreviousVersion(
-    (versions.Versions ?? []) as any,
-    currentBody.versionId,
-  );
-  if (!prevId) {
-    throw new Error('sem versão anterior para rollback');
-  }
-  const prev = await s3.send(
-    new GetObjectCommand({
-      Bucket: bucket,
-      Key: currentBody.key,
-      VersionId: prevId,
-    }),
-  );
-  const templateBody = await prev.Body!.transformToString();
-  await upsertStack(new CloudFormationClient({}), stackName, templateBody);
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: `templates/${stackName}/CURRENT`,
-      Body: JSON.stringify({ key: currentBody.key, versionId: prevId }),
-    }),
-  );
-  return prevId;
 }
 
 export default createBackendPlugin({
@@ -444,90 +519,36 @@ export default createBackendPlugin({
         logger: coreServices.logger,
       },
       async init({ httpRouter, config, database, logger }) {
-        await ensureAuditTable(database);
-        const bucket = config.getOptionalString('awsOps.bucket');
-        const router = createAwsOpsRouter();
-
-        // audit real substitui a rota 501 do router base
-        const auditClient = await database.getClient();
-        router.get('/audit', async (req, res) => {
-          const stack = String(req.query.stack ?? '');
-          const rows = await auditClient('aws_ops_audit')
-            .where(stack ? { stack } : {})
-            .orderBy('id', 'desc')
-            .limit(50);
-          res.json(rows);
-        });
-
-        const originalDeploy = router.stack.find(
-          l => (l as any).route?.path === '/deploy',
-        );
-        if (originalDeploy && bucket) {
-          const handler = (originalDeploy.route as any).stack[0].handle;
-          (originalDeploy.route as any).stack[0].handle = async (
-            req: express.Request,
-            res: express.Response,
-            next: express.NextFunction,
-          ) => {
-            req.body.bucket = bucket;
-            await handler(req, res, next);
-            await auditClient('aws_ops_audit').insert({
-              action: 'deploy',
-              stack: req.body?.stackName ?? '?',
-              result: res.statusCode,
-            });
-            logger.info(`aws-ops deploy audit: ${req.body?.stackName} -> ${res.statusCode}`);
-          };
-        }
-
-        const originalRollback = router.stack.find(
-          l => (l as any).route?.path === '/rollback',
-        );
-        if (originalRollback && bucket) {
-          const handler = (originalRollback.route as any).stack[0].handle;
-          (originalRollback.route as any).stack[0].handle = async (
-            req: express.Request,
-            res: express.Response,
-            next: express.NextFunction,
-          ) => {
-            req.body.bucket = bucket;
-            await handler(req, res, next);
-            await auditClient('aws_ops_audit').insert({
-              action: 'rollback',
-              stack: req.body?.stackName ?? '?',
-              result: res.statusCode,
-            });
-          };
-        }
-
-        httpRouter.use(router);
-        logger.info('plugin aws-ops inicializado');
+        const bucket = config.getString('awsOps.bucket');
+        const region = config.getOptionalString('awsOps.region') ?? 'us-east-1';
+        const binary = config.getOptionalString('awsOps.binary') ?? 'terraform';
+        const db = await database.getClient();
+        await ensureAuditTable(db);
+        httpRouter.use(createAwsOpsRouter({ bucket, region, binary, db }));
+        logger.info(`plugin aws-ops inicializado (binário: ${binary}, bucket: ${bucket})`);
       },
     });
   },
 });
 ```
 
-> Nota de implementação: o wrap de audit via `router.stack` é frágil. **Alternativa preferida se der problema:** mover `bucket`/`audit` como parâmetros de `createAwsOpsRouter(config, db)` e renunciar ao wrap — mais reto, recomendado durante a execução. O contrato HTTP e os testes permanecem idênticos.
-
-Registrar no backend — `packages/backend/src/index.ts`, antes de `backend.start();`:
+Registrar em `packages/backend/src/index.ts` (antes de `backend.start();`):
 
 ```ts
-// aws operations plugin (deploy/rollback/status)
+// aws operations plugin (deploy/rollback/status via terraform/tofu)
 backend.add(import('./aws-ops'));
 ```
 
 - [ ] **Step 4: Rodar testes e typecheck**
 
-Run: `yarn workspace backend test src/aws-ops.test.ts && yarn tsc`
-Expected: testes PASS, tsc sem erros.
-Se o wrap de audit quebrar o typecheck, aplicar a alternativa preferida (passar `config`/`db` como args de `createAwsOpsRouter`).
+Run: `yarn workspace backend test src/aws-ops.test.ts src/aws-ops-helpers.test.ts && yarn tsc`
+Expected: PASS, tsc sem erros.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add packages/backend/src/aws-ops.ts packages/backend/src/aws-ops.test.ts packages/backend/src/index.ts packages/backend/package.json yarn.lock
-git commit -m "feat(aws-ops): plugin backend com rotas status/deploy/rollback e audit log"
+git commit -m "feat(aws-ops): plugin backend terraform deploy/rollback/status com audit"
 ```
 
 ---
@@ -545,18 +566,14 @@ git commit -m "feat(aws-ops): plugin backend com rotas status/deploy/rollback e 
 - Consumes: HTTP API do Task 2 (`/api/aws-ops/...` via `fetchApiRef`), anotação de entidade `alura.tech/aws-stack`.
 - Produces: feature `awsOpsModule` (export default) registrada em `App.tsx`.
 
-- [ ] **Step 1: Deps e teste que falha**
-
-```bash
-yarn workspace app add @backstage/plugin-catalog-react
-```
+- [ ] **Step 1: Teste que falha**
 
 `packages/app/src/modules/aws-ops/AwsOpsCard.test.tsx`:
 
 ```tsx
 import { AwsOpsCard } from './AwsOpsCard';
 import { EntityProvider } from '@backstage/plugin-catalog-react';
-import { TestApiProvider, MockFetchApi } from '@backstage/test-utils';
+import { TestApiProvider } from '@backstage/test-utils';
 import { fetchApiRef } from '@backstage/core-plugin-api';
 import { render, screen, waitFor } from '@testing-library/react';
 
@@ -570,16 +587,15 @@ const entity = {
   spec: { type: 'service', lifecycle: 'production', owner: 'group:tech-preta' },
 };
 
-const fetchMock = { fetch: jest.fn().mockResolvedValue({
-  ok: true,
-  json: async () => ({
-    stackName: 'minha-api',
-    stackStatus: 'CREATE_COMPLETE',
+const fetchMock = {
+  fetch: jest.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({ stack: 'minha-api', outputs: {} }),
   }),
-}) };
+};
 
 describe('AwsOpsCard', () => {
-  it('mostra o status da stack vinda da API', async () => {
+  it('consulta o status da API ao renderizar', async () => {
     render(
       <TestApiProvider apis={[[fetchApiRef, fetchMock]]}>
         <EntityProvider entity={entity as any}>
@@ -588,11 +604,9 @@ describe('AwsOpsCard', () => {
       </TestApiProvider>,
     );
     await waitFor(() =>
-      expect(screen.getByText(/CREATE_COMPLETE/)).toBeInTheDocument(),
-    );
-    expect(fetchMock.fetch.fetch).toHaveBeenCalledWith(
-      expect.stringContaining('/api/aws-ops/status?stack=minha-api'),
-      expect.anything(),
+      expect(fetchMock.fetch.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/aws-ops/status?stack=minha-api'),
+      ),
     );
   });
 
@@ -629,13 +643,11 @@ import { useEffect, useState } from 'react';
 
 const ANNOTATION = 'alura.tech/aws-stack';
 
-type Status = { stackName: string; stackStatus: string };
-
 export const AwsOpsCard = () => {
   const { entity } = useEntity();
   const stackName = entity.metadata.annotations?.[ANNOTATION];
   const { fetch } = useApi(fetchApiRef);
-  const [status, setStatus] = useState<Status | null>(null);
+  const [status, setStatus] = useState<string>('consultando…');
   const [busy, setBusy] = useState(false);
 
   const refresh = async () => {
@@ -643,12 +655,12 @@ export const AwsOpsCard = () => {
     const res = await fetch(
       `/api/aws-ops/status?stack=${encodeURIComponent(stackName)}`,
     );
-    setStatus(res.ok ? await res.json() : null);
+    setStatus(res.ok ? 'provisionada' : 'não provisionada');
   };
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 10_000); // poll leve; stack em progresso atualiza sozinha
+    const t = setInterval(refresh, 15_000); // poll leve; apply em progresso aparece sozinho
     return () => clearInterval(t);
   }, [stackName]);
 
@@ -680,17 +692,12 @@ export const AwsOpsCard = () => {
   return (
     <InfoCard title={`Operações AWS — ${stackName}`}>
       <Typography variant="body1" data-testid="stack-status">
-        Status: {status?.stackStatus ?? 'consultando…'}
+        Status: {status}
       </Typography>
-      <Button
-        disabled={busy}
-        onClick={() =>
-          window.confirm(`Confirmar deploy de ${stackName}?`) &&
-          call('/api/aws-ops/deploy')
-        }
-      >
-        Deploy
-      </Button>
+      <Typography variant="body2" color="textSecondary">
+        O template HCL é enviado via API/Scaffolder; o card executa rollback e
+        consulta status.
+      </Typography>
       <Button
         disabled={busy}
         onClick={() =>
@@ -700,8 +707,6 @@ export const AwsOpsCard = () => {
       >
         Rollback
       </Button>
-      {/* ponytail: deploy envia template vazio no body; card pega o template
-      do repositório da entidade quando existir exemplos/aws no repo da aula */}
     </InfoCard>
   );
 };
@@ -751,7 +756,7 @@ export default createApp({
 });
 ```
 
-> Se `EntityCardBlueprint` não existir na versão instalada de `@backstage/plugin-catalog-react/alpha`, usar `createCardExtension` do mesmo pacote alpha (API anterior, mesmo efeito). Verificar com `grep -r EntityCardBlueprint node_modules/@backstage/plugin-catalog-react/alpha/dist` antes de decidir.
+> Se `EntityCardBlueprint` não existir na versão instalada de `@backstage/plugin-catalog-react/alpha`, verificar com `grep -r EntityCardBlueprint node_modules/@backstage/plugin-catalog-react/alpha/dist` e usar a API equivalente disponível (ex.: `createCardExtension`).
 
 - [ ] **Step 4: Rodar testes e typecheck**
 
@@ -761,76 +766,143 @@ Expected: PASS, sem erros de tipo.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/app/src/modules/aws-ops packages/app/src/App.tsx packages/app/package.json yarn.lock
+git add packages/app/src/modules/aws-ops packages/app/src/App.tsx
 git commit -m "feat(aws-ops): card Operações AWS na página da entidade"
 ```
 
 ---
 
-### Task 4: Config, stack de exemplo, entidade de exemplo e verificação manual
+### Task 4: Bootstrap do bucket de state + stack de exemplo + config
 
 **Files:**
-- Create: `examples/aws/stack-example.yaml`
+- Create: `examples/aws/bootstrap/main.tf` (cria o bucket versionado; state LOCAL — roda uma vez)
+- Create: `examples/aws/stack-example.tf` (template HCL que o bot aplica)
 - Create: `examples/aws/catalog-aws-component.yaml`
-- Create: `.env.example` (modificar: adicionar `AWS_REGION`, `AWS_OPS_BUCKET` — sem valores de chave)
 - Modify: `app-config.yaml` (bloco `awsOps:`)
+- Modify: `.env.example` (adicionar `AWS_REGION`, `AWS_OPS_BUCKET`, `TF_BINARY`)
 
 **Interfaces:**
-- Consumes: tudo das Tasks 1-3.
-- Produces: setup completo para a aula.
+- Consumes: nada do bot (infrastructure-only).
+- Produces: bucket `${AWS_OPS_BUCKET}` com versioning ativo — usado pelo backend s3 do bot (Task 2) e como arquivo dos templates versionados.
 
-- [ ] **Step 1: Stack de exemplo (Free Tier)**
+- [ ] **Step 1: Módulo bootstrap (state local, roda 1x)**
 
-`examples/aws/stack-example.yaml`:
+`examples/aws/bootstrap/main.tf`:
 
-```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Description: Stack de exemplo da aula - Lambda hello-world + tabela DynamoDB
-Resources:
-  HelloFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: alura-hello
-      Runtime: python3.12
-      Handler: index.handler
-      MemorySize: 128
-      Timeout: 10
-      Role: !GetAtt HelloRole.Arn
-      Code:
-        ZipFile: |
-          def handler(event, context):
-              return {"statusCode": 200, "body": "hello from aws-ops"}
-  HelloRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: alura-hello-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-  DemoTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: alura-demo
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - { AttributeName: id, AttributeType: S }
-      KeySchema:
-        - { AttributeName: id, KeyType: HASH }
+```hcl
+# Bootstrap: cria o bucket que guarda os states e templates do aws-ops.
+# Estado LOCAL de propósito (ovo-galinha): este módulo roda UMA vez, antes
+# de qualquer deploy do bot. Depois, o state do bot vive no bucket criado aqui.
+#
+# Uso (na raiz deste diretório):
+#   terraform init
+#   terraform apply -var="bucket=alura-aws-ops-templates"
+
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "bucket" {
+  type        = string
+  description = "Nome global do bucket de state/templates do aws-ops"
+}
+
+resource "aws_s3_bucket" "aws_ops" {
+  bucket = var.bucket
+}
+
+resource "aws_s3_bucket_versioning" "aws_ops" {
+  bucket = aws_s3_bucket.aws_ops.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+output "bucket" {
+  value = aws_s3_bucket.aws_ops.bucket
+}
 ```
 
-- [ ] **Step 2: Config e entidade de exemplo**
+> **Atenção (blast radius):** o `apply` acima cria 1 bucket S3 na conta — efeito limitado e reversível (`destroy` derruba SOMENTE este bucket). Não gerencia mais nada.
 
-Em `app-config.yaml`, adicionar:
+- [ ] **Step 2: Stack de exemplo (Free Tier)**
+
+`examples/aws/stack-example.tf` — este arquivo é o **templateBody** que o bot aplica (via API/Scaffolder):
+
+```hcl
+# Stack de exemplo da aula: Lambda hello-world + tabela DynamoDB.
+# O backend/provider são gerados pelo bot (backend.tf e provider.tf);
+# este arquivo contém apenas resources.
+
+resource "aws_lambda_function" "hello" {
+  function_name = "alura-hello"
+  runtime       = "python3.12"
+  handler       = "index.handler"
+  memory_size   = 128
+  timeout       = 10
+  role          = aws_iam_role.hello.arn
+
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+}
+
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  output_path = "/tmp/alura-hello-lambda.zip"
+  source {
+    content = <<PY
+def handler(event, context):
+    return {"statusCode": 200, "body": "hello from aws-ops"}
+PY
+    filename = "index.py"
+  }
+}
+
+resource "aws_iam_role" "hello" {
+  name = "alura-hello-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  managed_policy_arns = [
+    "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+  ]
+}
+
+resource "aws_dynamodb_table" "demo" {
+  name         = "alura-demo"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id"
+  attribute {
+    name = "id"
+    type = "S"
+  }
+}
+
+output "function_name" {
+  value = aws_lambda_function.hello.function_name
+}
+```
+
+- [ ] **Step 3: Config e entidade de exemplo**
+
+Em `app-config.yaml`:
 
 ```yaml
 awsOps:
-  region: ${AWS_REGION}
+  binary: ${TF_BINARY}
   bucket: ${AWS_OPS_BUCKET}
+  region: ${AWS_REGION}
 ```
 
 Em `.env.example`:
@@ -838,6 +910,7 @@ Em `.env.example`:
 ```bash
 AWS_REGION=us-east-1
 AWS_OPS_BUCKET=alura-aws-ops-templates
+TF_BINARY=tofu
 ```
 
 `examples/aws/catalog-aws-component.yaml`:
@@ -856,27 +929,23 @@ spec:
   owner: group:tech-preta
 ```
 
-- [ ] **Step 3: Verificação manual end-to-end (com credenciais da usuária)**
-
-Pré-requisitos (um vez, fora do repo):
-1. Criar bucket S3 com versioning: `aws s3api create-bucket --bucket $AWS_OPS_BUCKET --region us-east-1 && aws s3api put-bucket-versioning --bucket $AWS_OPS_BUCKET --versioning-configuration Status=Enabled`
-2. Perfil IAM local com policy mínima (documentada no Task 5).
-
-Checklist manual:
-1. `yarn dev` sobe sem erros; log mostra `plugin aws-ops inicializado`.
-2. Registrar `examples/aws/catalog-aws-component.yaml` no catálogo.
-3. Na entidade `minha-api-serverless`, o card mostra "Status: consultando…" → 404 tratado (stack não existe ainda).
-4. Deploy (via card com template do exemplo, ou curl): stack criada; `/status` → `CREATE_COMPLETE`.
-5. Modificar o template do exemplo (ex.: mudar a mensagem do Lambda) e fazer segundo deploy.
-6. Rollback: `/status` volta a refletir; bucket S3 mostra as 3 versões; audit log (`GET /api/aws-ops/audit`) tem deploy+rollback.
-
-> O deploy pelo card precisa do templateBody. MVP: botão Deploy usa o conteúdo fixo de `examples/aws/stack-example.yaml` embutido no card? Não — curl/Scaffolder cobre isso na aula; card só expõe rollback/status agora. Ajustar `AwsOpsCard` para omitir o botão Deploy até existir fonte de template (o rollback é o botão estrela da aula). Documentar essa decisão no Task 5.
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Validar sintaxe HCL (sem aplicar nada)**
 
 ```bash
-git add examples/aws app-config.yaml .env.example packages/app/src/modules/aws-ops/AwsOpsCard.tsx
-git commit -m "feat(aws-ops): stack de exemplo, config e entidade de catálogo"
+TF=$(command -v terraform || command -v tofu)
+cd examples/aws/bootstrap && $TF init -backend=false && $TF validate
+# para a stack de exemplo, copiar para um dir temporário (o data/archive precisa do provider aws):
+TF=$(command -v terraform || command -v tofu)
+TMP=$(mktemp -d) && cp examples/aws/stack-example.tf $TMP/ && cd $TMP && $TF init -backend=false && $TF validate
+```
+
+Expected: `Success! The configuration is valid.` nos dois.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add examples/aws app-config.yaml .env.example
+git commit -m "feat(aws-ops): bootstrap do bucket de state, stack de exemplo e config"
 ```
 
 ---
@@ -885,13 +954,15 @@ git commit -m "feat(aws-ops): stack de exemplo, config e entidade de catálogo"
 
 **Files:**
 - Create: `docs/aws-ops-bot.md`
-- Modify: `README.md` (link para o doc novo, se houver seção de docs)
 
 - [ ] **Step 1: Escrever o guia da aula em pt-BR**
 
 `docs/aws-ops-bot.md` — seções:
-1. O que o bot faz (deploy/rollback/status via CloudFormation; sem DeleteStack).
-2. Setup AWS: bucket S3 versionado, usuário/perfil IAM com policy mínima:
+1. O que o bot faz (deploy/rollback/status via Terraform/OpenTofu; sem destroy).
+2. **Setup AWS (uma vez):**
+   - Bootstrap do bucket: `cd examples/aws/bootstrap && terraform init && terraform apply -var="bucket=SEU_BUCKET"` (state local de propósito; ~2 recursos: bucket + versioning).
+   - Credenciais no `.env` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION`) — herdadas pela CLI tofu e pelo SDK.
+   - Policy IAM mínima (least-privilege, didática):
 
 ```json
 {
@@ -900,23 +971,43 @@ git commit -m "feat(aws-ops): stack de exemplo, config e entidade de catálogo"
     {
       "Effect": "Allow",
       "Action": [
-        "cloudformation:CreateStack", "cloudformation:UpdateStack",
-        "cloudformation:DescribeStacks"
+        "s3:PutObject", "s3:GetObject", "s3:ListBucket",
+        "s3:ListBucketVersions", "s3:GetObjectVersion"
+      ],
+      "Resource": [
+        "arn:aws:s3:::SEU_BUCKET",
+        "arn:aws:s3:::SEU_BUCKET/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction", "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration",
+        "lambda:GetFunction", "lambda:ListFunctions", "lambda:TagResource"
       ],
       "Resource": "*"
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket", "s3:ListBucketVersions"],
-      "Resource": ["arn:aws:s3:::${AWS_OPS_BUCKET}", "arn:aws:s3:::${AWS_OPS_BUCKET}/*"]
+      "Action": ["dynamodb:CreateTable", "dynamodb:DescribeTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable", "dynamodb:ListTables", "dynamodb:TagResource"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole", "iam:GetRole", "iam:CreateRole", "iam:DeleteRole",
+        "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:AttachRolePolicy", "iam:DetachRolePolicy",
+        "iam:ListAttachedRolePolicies", "iam:ListRolePolicies"
+      ],
+      "Resource": "*"
     }
   ]
 }
 ```
 
-3. Anotação `alura.tech/aws-stack` e registro da entidade.
-4. Fluxo da aula: deploy 1 → deploy 2 (mudança) → rollback → conferir audit log.
-5. Limitações conscientes (sem DeleteStack, card sem Deploy até haver fonte de template, audit em sqlite local) e caminho de evolução (RBAC, Slack, templates por repositório).
+3. Anotação `alura.tech/aws-stack` e registro da entidade no catálogo.
+4. Fluxo da aula: deploy 1 (`curl -X POST /api/aws-ops/deploy -H 'Content-Type: application/json' -d "{\"stackName\":\"minha-api-serverless\",\"templateBody\":\"$(cat examples/aws/stack-example.tf)\"}"`) → deploy 2 (mudar a mensagem do Lambda) → rollback pelo card → conferir audit log (`GET /api/aws-ops/audit`).
+5. Limitações conscientes (sem destroy; card só rollback/status; audit em sqlite local; workdir em /tmp; sem lock de state — um apply por vez) e caminho de evolução (RBAC, Slack, DynamoDB lock, templates por repositório, Scaffolder action `awsOps:deploy`).
 
 - [ ] **Step 2: Rodar a suíte completa**
 
@@ -926,7 +1017,7 @@ Expected: tudo PASS/limpo.
 - [ ] **Step 3: Commit final**
 
 ```bash
-git add docs/aws-ops-bot.md README.md
+git add docs/aws-ops-bot.md
 git commit -m "docs: guia da aula do bot operacional AWS (aws-ops)"
 ```
 
@@ -934,6 +1025,6 @@ git commit -m "docs: guia da aula do bot operacional AWS (aws-ops)"
 
 ## Self-Review (feito na escrita)
 
-- **Cobertura do spec:** status/deploy/rollback ✔ (Tasks 1-2), card UI com confirmação ✔ (Task 3), audit sqlite ✔ (Task 2), Free Tier/Lambda/DynamoDB ✔ (Task 4), credenciais via chain ✔ (Task 4/5), anotação `alura.tech/aws-stack` ✔ (Tasks 3-4), IAM least-privilege documentado ✔ (Task 5), fora de escopo respeitado (sem DeleteStack) ✔.
-- **Placeholders:** nenhum TBD; código completo em todas as tasks. Risco conhecido documentado: wrap de audit (Task 2) tem alternativa preferida explícita.
-- **Consistência de tipos:** `pickPreviousVersion(ObjectVersion[], string)` usada igualmente no rollback (Task 2) e nos testes (Task 1); contrato HTTP do Task 2 é exatamente o que o card do Task 3 consome; anotação `alura.tech/aws-stack` idêntica em Tasks 3, 4 e 5.
+- **Cobertura do spec:** deploy/rollback/status via Terraform/OpenTofu ✔ (Tasks 1-2), **bucket bootstrap com state local** ✔ (Task 4), card UI com confirmação ✔ (Task 3), audit sqlite ✔ (Task 2), Free Tier/Lambda/DynamoDB ✔ (Task 4), credenciais via chain ✔ (Task 5), anotação `alura.tech/aws-stack` ✔ (Tasks 3-5), IAM least-privilege ✔ (Task 5), sem destroy ✔ (Global Constraints).
+- **Placeholders:** nenhum TBD; código completo em todas as tasks.
+- **Consistência de tipos:** `pickPreviousVersion(ObjectVersion[], string)` igual em Task 1 (def) e Task 2 (uso no rollback); `runTerraform(binary, args, workdir, timeoutMs?)` igual em Tasks 1-2; contrato HTTP do Task 2 = consumo do card no Task 3; `awsOps.binary/bucket/region` idênticos em Task 2 (leitura), Task 4 (config) e Task 5 (guia).
