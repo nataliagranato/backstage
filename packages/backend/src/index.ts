@@ -69,4 +69,7 @@ backend.add(import('@backstage/plugin-signals-backend'));
 // mcp actions plugin
 backend.add(import('@backstage/plugin-mcp-actions-backend'));
 
+// aws operations plugin (deploy/rollback/status via terraform/tofu)
+backend.add(import('./aws-ops'));
+
 backend.start();
