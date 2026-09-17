@@ -2,7 +2,7 @@ import { AwsOpsCard } from './AwsOpsCard';
 import { EntityProvider } from '@backstage/plugin-catalog-react';
 import { TestApiProvider } from '@backstage/test-utils';
 import { fetchApiRef } from '@backstage/core-plugin-api';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 
 const entity = {
   apiVersion: 'backstage.io/v1alpha1',
@@ -47,5 +47,36 @@ describe('AwsOpsCard', () => {
       </TestApiProvider>,
     );
     expect(screen.getByText(/alura.tech\/aws-stack/)).toBeInTheDocument();
+  });
+
+  it('mostra erro quando o rollback falha com 409', async () => {
+    window.confirm = jest.fn(() => true);
+    render(
+      <TestApiProvider apis={[[fetchApiRef, fetchMock]]}>
+        <EntityProvider entity={entity as any}>
+          <AwsOpsCard />
+        </EntityProvider>
+      </TestApiProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId('stack-status')).toHaveTextContent(
+        'provisionada',
+      ),
+    );
+    fetchMock.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: 'rollback não executado' }),
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Rollback' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('stack-status')).toHaveTextContent(
+        'erro: rollback não executado',
+      ),
+    );
+    expect(fetchMock.fetch).toHaveBeenCalledWith(
+      '/api/aws-ops/rollback',
+      expect.anything(),
+    );
   });
 });

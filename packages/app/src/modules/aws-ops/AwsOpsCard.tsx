@@ -16,10 +16,14 @@ export const AwsOpsCard = () => {
 
   const refresh = useCallback(async () => {
     if (!stackName) return;
-    const res = await fetch(
-      `/api/aws-ops/status?stack=${encodeURIComponent(stackName)}`,
-    );
-    setStatus(res.ok ? 'provisionada' : 'não provisionada');
+    try {
+      const res = await fetch(
+        `/api/aws-ops/status?stack=${encodeURIComponent(stackName)}`,
+      );
+      setStatus(res.ok ? 'provisionada' : 'não provisionada');
+    } catch {
+      setStatus('erro ao consultar status');
+    }
   }, [fetch, stackName]);
 
   useEffect(() => {
@@ -42,11 +46,16 @@ export const AwsOpsCard = () => {
   const call = async (path: string) => {
     setBusy(true);
     try {
-      await fetch(path, {
+      const res = await fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stackName }),
       });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setStatus(`erro: ${body.error ?? res.status}`);
+        return;
+      }
       await refresh();
     } finally {
       setBusy(false);
