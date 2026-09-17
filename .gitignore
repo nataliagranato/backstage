@@ -54,3 +54,9 @@ e2e-test-report/
 
 # Cache
 .cache/
+
+# Terraform/OpenTofu
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl

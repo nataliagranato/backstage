@@ -1,0 +1,11 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: minha-api-serverless
+  description: API serverless gerenciada pelo bot aws-ops da aula
+  annotations:
+    alura.tech/aws-stack: minha-api-serverless
+spec:
+  type: service
+  lifecycle: production
+  owner: group:tech-preta

@@ -228,3 +228,8 @@ permission:
 mcpActions:
   name: 'My Company Backstage' # defaults to "backstage"
   description: 'Tools for managing your software catalog, creating new services from templates, and exploring your developer portal' # optional
+
+awsOps:
+  binary: ${TF_BINARY}
+  bucket: ${AWS_OPS_BUCKET}
+  region: ${AWS_REGION}
