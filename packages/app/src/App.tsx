@@ -3,7 +3,8 @@ import catalogPlugin from '@backstage/plugin-catalog/alpha';
 import { navModule } from './modules/nav';
 import { homeModule } from './modules/home';
 import awsOpsModule from './modules/aws-ops';
+import genaiModule from './modules/genai';
 
 export default createApp({
-  features: [catalogPlugin, navModule, homeModule, awsOpsModule],
+  features: [catalogPlugin, navModule, homeModule, awsOpsModule, genaiModule],
 });

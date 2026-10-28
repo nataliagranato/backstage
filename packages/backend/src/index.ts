@@ -66,10 +66,14 @@ backend.add(import('@backstage/plugin-user-settings-backend'));
 backend.add(import('@backstage/plugin-notifications-backend'));
 backend.add(import('@backstage/plugin-signals-backend'));
 
+// custom scaffolder actions
+backend.add(import('./verboo-actions'));
+
 // mcp actions plugin
 backend.add(import('@backstage/plugin-mcp-actions-backend'));
 
-// aws operations plugin (deploy/rollback/status via terraform/tofu)
-backend.add(import('./aws-ops'));
+// genai chat assistant (AWS plugins + agent LangGraph via Verboo)
+backend.add(import('@aws/genai-plugin-for-backstage-backend'));
+backend.add(import('@aws/genai-plugin-langgraph-agent-for-backstage'));
 
 backend.start();

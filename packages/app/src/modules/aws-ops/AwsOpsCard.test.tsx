@@ -50,7 +50,6 @@ describe('AwsOpsCard', () => {
   });
 
   it('mostra erro quando o rollback falha com 409', async () => {
-    window.confirm = jest.fn(() => true);
     render(
       <TestApiProvider apis={[[fetchApiRef, fetchMock]]}>
         <EntityProvider entity={entity as any}>
@@ -69,6 +68,11 @@ describe('AwsOpsCard', () => {
       json: async () => ({ error: 'rollback não executado' }),
     });
     fireEvent.click(screen.getByRole('button', { name: 'Rollback' }));
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'Confirmar rollback de minha-api?',
+      }),
+    );
     await waitFor(() =>
       expect(screen.getByTestId('stack-status')).toHaveTextContent(
         'erro: rollback não executado',

@@ -1,5 +1,5 @@
 app:
-  title: Scaffolded Backstage App
+  title: Alura Online
   baseUrl: http://localhost:3000
 
   # Enable all packages by default, this will discover packages from packages/app/package.json
@@ -97,13 +97,16 @@ app:
               height: 4
 
 organization:
-  name: My Company
+  name: Alura Online
 
 backend:
   # Used for enabling authentication, secret is shared by all backend plugins
   # See https://backstage.io/docs/auth/service-to-service-auth for
   # information on the format
-  # auth:
+  auth:
+    # Dev local: dispensa o token de serviço nas chamadas da API (aula/QA).
+    # NÃO usar em produção — ver app-config.production.yaml.
+    dangerouslyDisableDefaultAuthPolicy: true
   #   keys:
   #     - secret: ${BACKEND_SECRET}
   baseUrl: http://localhost:7007
@@ -112,7 +115,7 @@ backend:
     # Uncomment the following host directive to bind to specific interfaces
     # host: 127.0.0.1
   csp:
-    connect-src: ["'self'", 'http:', 'https:']
+    connect-src: ["'self'", "http:", "https:"]
     # Content-Security-Policy directives follow the Helmet format: https://helmetjs.github.io/#reference
     # Default Helmet Content-Security-Policy values can be removed by setting the key to false
   cors:
@@ -121,9 +124,16 @@ backend:
     credentials: true
   # This is for local development only, it is not recommended to use this in production
   # The production database configuration is stored in app-config.production.yaml
+  # Postgres local via docker compose (serviço `postgres`), ver docker-compose.yaml.
+  # Para voltar ao sqlite em memória: client better-sqlite3 + connection ":memory:".
   database:
-    client: better-sqlite3
-    connection: ':memory:'
+    client: pg
+    connection:
+      host: ${POSTGRES_HOST}
+      port: ${POSTGRES_PORT}
+      database: ${POSTGRES_DB}
+      user: ${POSTGRES_USER}
+      password: ${POSTGRES_PASSWORD}
   # see https://backstage.io/docs/ai/mcp-actions#actions-configuration for more details
   actions:
     pluginSources:
@@ -156,11 +166,11 @@ proxy:
 # and an external cloud storage when deploying TechDocs for production use-case.
 # https://backstage.io/docs/features/techdocs/how-to-guides#how-to-migrate-from-techdocs-basic-to-recommended-deployment-approach
 techdocs:
-  builder: 'local' # Alternatives - 'external'
+  builder: "local" # Alternatives - 'external'
   generator:
-    runIn: 'docker' # Alternatives - 'local'
+    runIn: "docker" # Alternatives - 'local'
   publisher:
-    type: 'local' # Alternatives - 'googleGcs' or 'awsS3'. Read documentation for using alternatives.
+    type: "local" # Alternatives - 'googleGcs' or 'awsS3'. Read documentation for using alternatives.
 
 auth:
   # see https://backstage.io/docs/auth/ to learn about auth providers
@@ -187,6 +197,13 @@ catalog:
   import:
     entityFilename: catalog-info.yaml
     pullRequestBranchName: backstage-integration
+  providers:
+    github:
+      techPreta:
+        organization: Tech-Preta
+        schedule:
+          frequency: { minutes: 30 }
+          timeout: { minutes: 3 }
   rules:
     - allow: [Component, System, API, Resource, Location]
   locations:
@@ -197,6 +214,18 @@ catalog:
     # Local example template
     - type: file
       target: ../../examples/template/template.yaml
+      rules:
+        - allow: [Template]
+
+    # AI-powered Python golden path template
+    - type: file
+      target: ../../examples/python/template.yaml
+      rules:
+        - allow: [Template]
+
+    # Terraform SQS - provisionamento assistido via PR
+    - type: file
+      target: ../../examples/aws/sqs/template.yaml
       rules:
         - allow: [Template]
 
@@ -226,10 +255,31 @@ permission:
 
 # see https://backstage.io/docs/ai/mcp-actions for more details
 mcpActions:
-  name: 'My Company Backstage' # defaults to "backstage"
-  description: 'Tools for managing your software catalog, creating new services from templates, and exploring your developer portal' # optional
+  name: "Alura Online" # defaults to "backstage"
+  description: "Tools for managing your software catalog, creating new services from templates, and exploring your developer portal" # optional
 
-awsOps:
-  binary: ${TF_BINARY}
-  bucket: ${AWS_OPS_BUCKET}
-  region: ${AWS_REGION}
+registerCoreActions: true
+agents:
+  general: # corresponde à URL /assistant/general
+    description: Assistente de chat geral da plataforma focado em engenharia e infraestrutura
+    prompt: >
+      Você é um Engenheiro de Plataforma Sênior, especialista em Cloud, Infraestrutura como Código (IaC),
+      Containers, Kubernetes e desenvolvimento em Golang. Seu objetivo é apoiar desenvolvedores e equipes 
+      de operações a construir, manter e escalar aplicações cloud-native de forma eficiente.
+
+      Você possui profundo conhecimento na criação de operadores Kubernetes e ferramentas de CLI em Go,
+      automação de infraestrutura utilizando Terraform e Ansible, e implementação de fluxos de GitOps com
+      ArgoCD e Helm. Sua especialidade abrange a arquitetura e administração de clusters (como EKS, AKS, 
+      RKE2 e k3s), observabilidade (Prometheus, Grafana, OpenTelemetry) e integração com portais de 
+      desenvolvedores internos (como Backstage).
+
+      Responda às perguntas de forma sucinta, pragmática e fácil de entender, sempre em português brasileiro.
+      Sempre que aplicável, forneça exemplos de código limpos e recomende as melhores práticas de DevSecOps 
+      e resiliência.
+
+    langgraph:
+      messagesMaxTokens: 150000
+      openai:
+        apiKey: ${VERBOO_API_KEY}
+        baseUrl: ${VERBOO_ENDPOINT}
+        modelName: ${VERBOO_MODEL}

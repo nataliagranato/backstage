@@ -6,7 +6,8 @@
     "node": "22 || 24"
   },
   "scripts": {
-    "start": "backstage-cli repo start",
+    "start": "dotenv -e .env -- backstage-cli repo start",
+    "start:all": "yarn start & yarn workspace aws-ops-slack start & wait",
     "build:backend": "yarn workspace backend build",
     "build:all": "backstage-cli repo build --all",
     "build-image": "yarn workspace backend build-image",
@@ -42,6 +43,7 @@
     "@jest/environment-jsdom-abstract": "~30.2.0",
     "@playwright/test": "^1.32.3",
     "@types/jest": "^30.0.0",
+    "dotenv-cli": "^11.0.0",
     "jest": "~30.2.0",
     "jsdom": "^27.1.0",
     "node-gyp": "^10.0.0",
@@ -50,7 +52,8 @@
   },
   "resolutions": {
     "@types/react": "^18",
-    "@types/react-dom": "^18"
+    "@types/react-dom": "^18",
+    "better-sqlite3@npm:^11.7.0": "npm:^12.4.1"
   },
   "prettier": "@backstage/cli/config/prettier",
   "lint-staged": {

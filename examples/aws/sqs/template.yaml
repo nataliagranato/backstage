@@ -1,0 +1,87 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: terraform-sqs
+  title: Provisionar fila SQS (Terraform via PR)
+  description: Gera o Terraform de uma fila SQS e abre um Pull Request no repositório de infraestrutura — provisionamento assistido, nada é aplicado sem review.
+  tags:
+    - iac
+    - terraform
+    - aws
+    - sqs
+  links:
+    - title: Documentação Software Templates
+      url: https://backstage.io/docs/features/software-templates
+      icon: docs
+spec:
+  owner: group:tech-preta
+  type: infra-as-code
+
+  parameters:
+    - title: Dados da fila
+      required:
+        - name
+      properties:
+        name:
+          title: Nome da fila SQS
+          type: string
+          description: Nome da fila a ser criada (ex. pedidos-eventos)
+          ui:autofocus: true
+        company:
+          title: Tag de identificação (time/área)
+          type: string
+          description: Valor da tag Company no recurso (opcional)
+          default: platform-team
+        create_dlq:
+          title: Criar DLQ (Dead Letter Queue)?
+          type: boolean
+          default: true
+
+  steps:
+    - id: fetch-template
+      name: Renderizar Terraform
+      action: fetch:template
+      input:
+        targetPath: ./outputs/terraform
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+          company: ${{ parameters.company }}
+          create_dlq: ${{ parameters.create_dlq }}
+
+    - id: terraform_pr
+      name: Criar Pull Request do Terraform
+      action: publish:github:pull-request
+      input:
+        # host e owner são fixos pela integração Tech-Preta, não expostos ao usuário
+        repoUrl: github.com?repo=backstage&owner=Tech-Preta
+        branchName: 'backstage/sqs/${{ parameters.name }}'
+        title: '🔩 Provisionar fila SQS ${{ parameters.name }}'
+        description: |
+          ## Fila SQS `${{ parameters.name }}`
+
+          Pull request criado automaticamente pelo Backstage Software Template.
+          Revise os parâmetros antes de aplicar. Para adicionar mais opções,
+          consulte a documentação do módulo:
+          https://registry.terraform.io/modules/terraform-aws-modules/sqs/aws/latest
+
+          *criado por: [Backstage Software Template](https://backstage.io/docs/features/software-templates)*
+        sourcePath: ./outputs/terraform
+        targetPath: 'terraform/aws/production/sqs/${{ parameters.name }}'
+
+    - id: label_pr
+      name: Adicionar labels no PR
+      action: github:issues:label
+      input:
+        repoUrl: github.com?repo=backstage&owner=Tech-Preta
+        number: '${{ steps.terraform_pr.output.pullRequestNumber }}'
+        labels:
+          - terraform
+          - created-by-backstage
+          - sqs
+
+  output:
+    links:
+      - title: Ver seu Pull Request
+        icon: github
+        url: ${{ steps.terraform_pr.output.remoteUrl }}

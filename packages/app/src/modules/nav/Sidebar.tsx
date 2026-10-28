@@ -13,6 +13,7 @@ import SearchIcon from '@material-ui/icons/Search';
 import { SidebarSearchModal } from '@backstage/plugin-search';
 import { UserSettingsSignInAvatar } from '@backstage/plugin-user-settings';
 import { NotificationsSidebarItem } from '@backstage/plugin-notifications';
+import ChatIcon from '@material-ui/icons/Chat';
 
 export const SidebarContent = NavContentBlueprint.make({
   params: {
@@ -36,6 +37,7 @@ export const SidebarContent = NavContentBlueprint.make({
             {nav.take('page:home')}
             {nav.take('page:catalog')}
             {nav.take('page:scaffolder')}
+            <SidebarItem icon={ChatIcon} to="/assistant/general" text="Chat Assistant" />
             <SidebarDivider />
             <SidebarScrollWrapper>
               {nav.rest({ sortBy: 'title' })}

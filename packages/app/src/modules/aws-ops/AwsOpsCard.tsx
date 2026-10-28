@@ -13,6 +13,7 @@ export const AwsOpsCard = () => {
   const { fetch } = useApi(fetchApiRef);
   const [status, setStatus] = useState<string>('consultando…');
   const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!stackName) return;
@@ -20,9 +21,12 @@ export const AwsOpsCard = () => {
       const res = await fetch(
         `/api/aws-ops/status?stack=${encodeURIComponent(stackName)}`,
       );
-      setStatus(res.ok ? 'provisionada' : 'não provisionada');
+      const next = res.ok ? 'provisionada' : 'não provisionada';
+      setStatus((cur) => (cur.startsWith('erro') ? cur : next));
     } catch {
-      setStatus('erro ao consultar status');
+      setStatus((cur) =>
+        cur.startsWith('erro') ? cur : 'erro ao consultar status',
+      );
     }
   }, [fetch, stackName]);
 
@@ -45,6 +49,7 @@ export const AwsOpsCard = () => {
 
   const call = async (path: string) => {
     setBusy(true);
+    setStatus('consultando…'); // limpa erro anterior ao tentar de novo
     try {
       const res = await fetch(path, {
         method: 'POST',
@@ -73,12 +78,17 @@ export const AwsOpsCard = () => {
       </Typography>
       <Button
         disabled={busy}
-        onClick={() =>
-          window.confirm(`Confirmar rollback de ${stackName}?`) &&
-          call('/api/aws-ops/rollback')
-        }
+        color={confirming ? 'secondary' : 'primary'}
+        onClick={() => {
+          if (!confirming) {
+            setConfirming(true);
+            return;
+          }
+          setConfirming(false);
+          call('/api/aws-ops/rollback');
+        }}
       >
-        Rollback
+        {confirming ? `Confirmar rollback de ${stackName}?` : 'Rollback'}
       </Button>
     </InfoCard>
   );
